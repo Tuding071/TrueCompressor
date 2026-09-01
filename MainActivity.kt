@@ -38,20 +38,22 @@ import kotlinx.coroutines.withContext
 import java.util.UUID
 import kotlin.math.max
 
-enum class ImgStatus { QUEUED, PROCESSING, DONE, ERROR }
+enum class ImgStatus { QUEUED, ANALYZING, DOWNSCALING, SAVING, DONE, ERROR }
 
 data class ImgItem(
     val id: String = UUID.randomUUID().toString(),
     val uri: Uri,
     val name: String,
     var status: ImgStatus = ImgStatus.QUEUED,
+    var progress: Int = 0,
     var origW: Int = 0,
     var origH: Int = 0,
     var outW: Int = 0,
     var outH: Int = 0,
     var outUri: Uri? = null,
     var errorMsg: String = "",
-    var thumb: Bitmap? = null
+    var thumb: Bitmap? = null,
+    var logs: MutableList<String> = mutableStateListOf()
 )
 
 class MainActivity : ComponentActivity() {
@@ -73,6 +75,7 @@ fun AppRoot() {
     val scope = rememberCoroutineScope()
     val items = remember { mutableStateListOf<ImgItem>() }
     var compareItem by remember { mutableStateOf<ImgItem?>(null) }
+    var logItem by remember { mutableStateOf<ImgItem?>(null) }
 
     val picker = rememberLauncherForActivityResult(
         ActivityResultContracts.GetMultipleContents()
@@ -90,19 +93,20 @@ fun AppRoot() {
         }
     }
 
-    if (compareItem != null) {
-        CompareScreen(item = compareItem!!, onBack = { compareItem = null })
-    } else {
-        MainScreen(
+    when {
+        compareItem != null -> CompareScreen(item = compareItem!!, onBack = { compareItem = null })
+        logItem != null -> LogScreen(item = logItem!!, onBack = { logItem = null })
+        else -> MainScreen(
             items = items,
             onPick = { picker.launch("image/*") },
-            onItemClick = { item -> if (item.status == ImgStatus.DONE) compareItem = item }
+            onItemClick = { item -> if (item.status == ImgStatus.DONE) compareItem = item },
+            onLogClick = { item -> logItem = item }
         )
     }
 }
 
 @Composable
-fun MainScreen(items: List<ImgItem>, onPick: () -> Unit, onItemClick: (ImgItem) -> Unit) {
+fun MainScreen(items: List<ImgItem>, onPick: () -> Unit, onItemClick: (ImgItem) -> Unit, onLogClick: (ImgItem) -> Unit) {
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
         Text("True Resolution Compressor", fontSize = 22.sp, fontWeight = FontWeight.Bold)
         Spacer(modifier = Modifier.height(4.dp))
@@ -119,7 +123,7 @@ fun MainScreen(items: List<ImgItem>, onPick: () -> Unit, onItemClick: (ImgItem) 
         } else {
             LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(items) { item ->
-                    ImgRow(item, onClick = { onItemClick(item) })
+                    ImgRow(item, onClick = { onItemClick(item) }, onLogClick = { onLogClick(item) })
                 }
             }
         }
@@ -127,41 +131,71 @@ fun MainScreen(items: List<ImgItem>, onPick: () -> Unit, onItemClick: (ImgItem) 
 }
 
 @Composable
-fun ImgRow(item: ImgItem, onClick: () -> Unit) {
-    Row(
+fun ImgRow(item: ImgItem, onClick: () -> Unit, onLogClick: () -> Unit) {
+    Column(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(10.dp))
             .background(Color(0xFFF0F0F0))
-            .clickable(enabled = item.status == ImgStatus.DONE) { onClick() }
-            .padding(10.dp),
-        verticalAlignment = Alignment.CenterVertically
+            .clickable {
+                if (item.status == ImgStatus.DONE) onClick() else onLogClick()
+            }
+            .padding(10.dp)
     ) {
-        Box(
-            modifier = Modifier
-                .size(56.dp)
-                .clip(RoundedCornerShape(6.dp))
-                .background(Color(0xFFDDDDDD)),
-            contentAlignment = Alignment.Center
-        ) {
-            item.thumb?.let {
-                Image(it.asImageBitmap(), contentDescription = null, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                modifier = Modifier
+                    .size(56.dp)
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(Color(0xFFDDDDDD)),
+                contentAlignment = Alignment.Center
+            ) {
+                item.thumb?.let {
+                    Image(it.asImageBitmap(), contentDescription = null, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                }
             }
-        }
-        Spacer(modifier = Modifier.width(12.dp))
-        Column(modifier = Modifier.weight(1f)) {
-            Text(item.name, fontSize = 14.sp, fontWeight = FontWeight.Medium, maxLines = 1)
-            Spacer(modifier = Modifier.height(2.dp))
-            val statusText = when (item.status) {
-                ImgStatus.QUEUED -> "Queued"
-                ImgStatus.PROCESSING -> "Processing..."
-                ImgStatus.DONE -> "${item.origW}x${item.origH} → ${item.outW}x${item.outH}"
-                ImgStatus.ERROR -> "Error: ${item.errorMsg}"
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(item.name, fontSize = 14.sp, fontWeight = FontWeight.Medium, maxLines = 1)
+                Spacer(modifier = Modifier.height(2.dp))
+                val statusText = when (item.status) {
+                    ImgStatus.QUEUED -> "Queued"
+                    ImgStatus.ANALYZING -> "Analyzing... ${item.progress}%"
+                    ImgStatus.DOWNSCALING -> "Downscaling..."
+                    ImgStatus.SAVING -> "Saving..."
+                    ImgStatus.DONE -> "${item.origW}x${item.origH} → ${item.outW}x${item.outH}  (tap: compare, log icon: details)"
+                    ImgStatus.ERROR -> "Error: ${item.errorMsg}"
+                }
+                Text(statusText, fontSize = 12.sp, color = Color.Gray, maxLines = 2)
             }
-            Text(statusText, fontSize = 12.sp, color = Color.Gray)
+            if (item.status !in listOf(ImgStatus.DONE, ImgStatus.ERROR, ImgStatus.QUEUED)) {
+                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+            }
+            Spacer(modifier = Modifier.width(8.dp))
+            TextButton(onClick = onLogClick) { Text("Logs", fontSize = 11.sp) }
         }
-        if (item.status == ImgStatus.PROCESSING) {
-            CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+        if (item.status == ImgStatus.ANALYZING) {
+            Spacer(modifier = Modifier.height(6.dp))
+            LinearProgressIndicator(
+                progress = { item.progress / 100f },
+                modifier = Modifier.fillMaxWidth().height(4.dp)
+            )
+        }
+    }
+}
+
+@Composable
+fun LogScreen(item: ImgItem, onBack: () -> Unit) {
+    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+        TextButton(onClick = onBack) { Text("← Back") }
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(item.name, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+        Text("Status: ${item.status}", fontSize = 13.sp, color = Color.Gray)
+        Spacer(modifier = Modifier.height(12.dp))
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            items(item.logs) { line ->
+                Text(line, fontSize = 12.sp, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace)
+            }
         }
     }
 }
@@ -213,7 +247,14 @@ fun CompareScreen(item: ImgItem, onBack: () -> Unit) {
 // ---------- Processing ----------
 
 suspend fun processImage(context: Context, item: ImgItem) {
-    item.status = ImgStatus.PROCESSING
+    fun log(msg: String) {
+        item.logs.add(msg)
+    }
+
+    item.status = ImgStatus.ANALYZING
+    item.progress = 0
+    log("Starting: ${item.name}")
+
     try {
         withContext(Dispatchers.IO) {
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
@@ -222,18 +263,26 @@ suspend fun processImage(context: Context, item: ImgItem) {
             }
             val origW = bounds.outWidth
             val origH = bounds.outHeight
-            if (origW <= 0 || origH <= 0) throw Exception("Cannot read image")
+            if (origW <= 0 || origH <= 0) throw Exception("Cannot read image dimensions")
 
             item.origW = origW
             item.origH = origH
+            log("Original size: ${origW}x${origH}")
 
-            // Working copy capped at 3000px long side for analysis speed
             val analysisBitmap = loadBitmapFromUri(context, item.uri, 3000)
-                ?: throw Exception("Decode failed")
+                ?: throw Exception("Decode failed for analysis")
 
             item.thumb = Bitmap.createScaledBitmap(analysisBitmap, 56, 56, true)
+            log("Analysis copy: ${analysisBitmap.width}x${analysisBitmap.height}")
 
-            val bestRatio = findTrueResolutionRatio(analysisBitmap)
+            val bestRatio = findTrueResolutionRatio(analysisBitmap) { step, ratio, score, progress ->
+                log("Step $step: ${(ratio * 100).toInt()}% scale -> sharpness score ${"%.4f".format(score)}")
+                item.progress = progress
+            }
+
+            log("Chosen ratio: ${(bestRatio * 100).toInt()}%")
+
+            item.status = ImgStatus.DOWNSCALING
 
             val targetW = max(400, (origW * bestRatio).toInt())
             val targetH = max(400, (origH * bestRatio).toInt())
@@ -242,22 +291,28 @@ suspend fun processImage(context: Context, item: ImgItem) {
                 ?: throw Exception("Full decode failed")
 
             val output = if (bestRatio >= 0.99) {
+                log("No downscale needed — image is already at true resolution")
                 fullBitmap
             } else {
+                log("Downscaling to ${targetW}x${targetH}")
                 Bitmap.createScaledBitmap(fullBitmap, targetW, targetH, true)
             }
 
+            item.status = ImgStatus.SAVING
             val savedUri = saveToMediaStore(context, item.name, output)
-                ?: throw Exception("Save failed")
+                ?: throw Exception("MediaStore save failed")
+            log("Saved to: $savedUri")
 
             item.outW = output.width
             item.outH = output.height
             item.outUri = savedUri
             item.status = ImgStatus.DONE
+            log("Done.")
         }
     } catch (e: Exception) {
         item.errorMsg = e.message ?: "Unknown error"
         item.status = ImgStatus.ERROR
+        log("ERROR: ${item.errorMsg}")
     }
 }
 
@@ -293,28 +348,51 @@ fun saveToMediaStore(context: Context, name: String, bitmap: Bitmap): Uri? {
     return uri
 }
 
-// Downscale ladder: find where sharpness-per-pixel plateaus
-fun findTrueResolutionRatio(bitmap: Bitmap): Double {
+/**
+ * Downscale ladder: compute sharpness-per-pixel at each scale step.
+ * As we shrink a blurry image, sharpness-per-pixel RISES while we're only removing
+ * "empty" upscaled pixels, then FLATTENS once we start cutting into real detail.
+ * We want the ratio just BEFORE it flattens — i.e. the smallest ratio that still
+ * shows meaningful improvement over the previous step.
+ * Bias: conservative (under-downscale) — requires two consecutive weak-gain steps
+ * before committing to a plateau, and defaults to a higher (safer) ratio on ambiguity.
+ */
+fun findTrueResolutionRatio(
+    bitmap: Bitmap,
+    onStep: (step: Int, ratio: Double, score: Double, progress: Int) -> Unit
+): Double {
     val steps = listOf(1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.25)
-    var prevScore = -1.0
-    var bestRatio = 1.0
+    val scores = DoubleArray(steps.size)
 
-    for (ratio in steps) {
+    for ((i, ratio) in steps.withIndex()) {
         val w = max(1, (bitmap.width * ratio).toInt())
         val h = max(1, (bitmap.height * ratio).toInt())
         val scaled = if (ratio == 1.0) bitmap else Bitmap.createScaledBitmap(bitmap, w, h, true)
-        val score = laplacianVariancePerPixel(scaled)
-
-        if (prevScore >= 0) {
-            val gain = (score - prevScore) / prevScore
-            if (gain < 0.02) {
-                return bestRatio
-            }
-        }
-        prevScore = score
-        bestRatio = ratio
+        scores[i] = laplacianVariancePerPixel(scaled)
+        onStep(i + 1, ratio, scores[i], ((i + 1) * 100) / steps.size)
     }
-    return bestRatio
+
+    // Conservative plateau detection: require 2 consecutive steps with <3% gain
+    // before accepting a plateau, otherwise keep the higher-resolution ratio.
+    var weakStreak = 0
+    for (i in 1 until steps.size) {
+        val prev = scores[i - 1]
+        val curr = scores[i]
+        if (prev <= 0.0) continue
+        val gain = (curr - prev) / prev
+        if (gain < 0.03) {
+            weakStreak++
+            if (weakStreak >= 2) {
+                // plateau confirmed — true resolution is the ratio BEFORE this weak streak started
+                return steps[i - weakStreak]
+            }
+        } else {
+            weakStreak = 0
+        }
+    }
+
+    // No clear plateau found — conservative default: keep original (don't downscale)
+    return 1.0
 }
 
 fun laplacianVariancePerPixel(bitmap: Bitmap): Double {
@@ -325,9 +403,10 @@ fun laplacianVariancePerPixel(bitmap: Bitmap): Double {
     val stepX = max(1, w / 400)
     val stepY = max(1, h / 400)
 
-    val gray = IntArray(w * h)
     val pixels = IntArray(w * h)
     bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
+
+    val gray = IntArray(w * h)
     for (i in pixels.indices) {
         val p = pixels[i]
         val r = (p shr 16) and 0xFF
@@ -361,7 +440,7 @@ fun laplacianVariancePerPixel(bitmap: Bitmap): Double {
     if (count == 0) return 0.0
     val mean = sum / count
     val variance = (sumSq / count) - (mean * mean)
-    return variance / count
+    return variance
 }
 
 fun loadBitmapFromUri(context: Context, uri: Uri, maxDim: Int): Bitmap? {
