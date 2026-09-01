@@ -134,9 +134,19 @@ jobs:
                   }
               }
 
+              signingConfigs {
+                  create("release") {
+                      storeFile = file("release.keystore")
+                      storePassword = "android123"
+                      keyAlias = "truerescompressor"
+                      keyPassword = "android123"
+                  }
+              }
+
               buildTypes {
                   release {
                       isMinifyEnabled = false
+                      signingConfig = signingConfigs.getByName("release")
                   }
               }
           }
@@ -183,6 +193,15 @@ jobs:
           android.useAndroidX=true
           kotlin.code.style=official
           EOF
+
+      - name: Generate test signing keystore
+        run: |
+          keytool -genkeypair -v \
+            -keystore app/release.keystore \
+            -alias truerescompressor \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android123 -keypass android123 \
+            -dname "CN=Dev, OU=Dev, O=Dev, L=Dev, S=Dev, C=US"
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
