@@ -1,11 +1,14 @@
 package com.grey.truerescompressor
 
+import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.provider.MediaStore
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -19,26 +22,21 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.File
-import java.io.FileOutputStream
 import java.util.UUID
 import kotlin.math.max
-import kotlin.math.min
-import kotlin.math.sqrt
 
 enum class ImgStatus { QUEUED, PROCESSING, DONE, ERROR }
 
@@ -51,7 +49,7 @@ data class ImgItem(
     var origH: Int = 0,
     var outW: Int = 0,
     var outH: Int = 0,
-    var outPath: String = "",
+    var outUri: Uri? = null,
     var errorMsg: String = "",
     var thumb: Bitmap? = null
 )
@@ -175,7 +173,7 @@ fun CompareScreen(item: ImgItem, onBack: () -> Unit) {
 
     val bitmap = remember(showOriginal) {
         if (showOriginal) loadBitmapFromUri(context, item.uri, 1600)
-        else BitmapFactory.decodeFile(item.outPath)
+        else item.outUri?.let { loadBitmapFromUri(context, it, 1600) }
     }
 
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
@@ -249,22 +247,50 @@ suspend fun processImage(context: Context, item: ImgItem) {
                 Bitmap.createScaledBitmap(fullBitmap, targetW, targetH, true)
             }
 
-            val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "TrueRes")
-            if (!dir.exists()) dir.mkdirs()
-            val outFile = File(dir, item.name)
-            FileOutputStream(outFile).use { fos ->
-                output.compress(Bitmap.CompressFormat.JPEG, 95, fos)
-            }
+            val savedUri = saveToMediaStore(context, item.name, output)
+                ?: throw Exception("Save failed")
 
             item.outW = output.width
             item.outH = output.height
-            item.outPath = outFile.absolutePath
+            item.outUri = savedUri
             item.status = ImgStatus.DONE
         }
     } catch (e: Exception) {
         item.errorMsg = e.message ?: "Unknown error"
         item.status = ImgStatus.ERROR
     }
+}
+
+fun saveToMediaStore(context: Context, name: String, bitmap: Bitmap): Uri? {
+    val values = ContentValues().apply {
+        put(MediaStore.Images.Media.DISPLAY_NAME, name)
+        put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/TrueRes")
+            put(MediaStore.Images.Media.IS_PENDING, 1)
+        }
+    }
+
+    val resolver = context.contentResolver
+    val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+    } else {
+        MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+    }
+
+    val uri = resolver.insert(collection, values) ?: return null
+
+    resolver.openOutputStream(uri)?.use { out ->
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
+    }
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        values.clear()
+        values.put(MediaStore.Images.Media.IS_PENDING, 0)
+        resolver.update(uri, values, null, null)
+    }
+
+    return uri
 }
 
 // Downscale ladder: find where sharpness-per-pixel plateaus
@@ -282,7 +308,6 @@ fun findTrueResolutionRatio(bitmap: Bitmap): Double {
         if (prevScore >= 0) {
             val gain = (score - prevScore) / prevScore
             if (gain < 0.02) {
-                // plateaued — previous ratio was the true resolution
                 return bestRatio
             }
         }
@@ -292,13 +317,11 @@ fun findTrueResolutionRatio(bitmap: Bitmap): Double {
     return bestRatio
 }
 
-// Laplacian variance (edge energy) normalized per pixel, computed on a grayscale downsample for speed
 fun laplacianVariancePerPixel(bitmap: Bitmap): Double {
     val w = bitmap.width
     val h = bitmap.height
     if (w < 3 || h < 3) return 0.0
 
-    // Sample on a grid to keep this fast (every 2nd pixel) for large images
     val stepX = max(1, w / 400)
     val stepY = max(1, h / 400)
 
@@ -338,7 +361,7 @@ fun laplacianVariancePerPixel(bitmap: Bitmap): Double {
     if (count == 0) return 0.0
     val mean = sum / count
     val variance = (sumSq / count) - (mean * mean)
-    return variance / count // normalize per sampled pixel
+    return variance / count
 }
 
 fun loadBitmapFromUri(context: Context, uri: Uri, maxDim: Int): Bitmap? {
