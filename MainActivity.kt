@@ -29,6 +29,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -163,7 +164,7 @@ fun ImgRow(item: ImgItem, onClick: () -> Unit, onLogClick: () -> Unit) {
                     ImgStatus.ANALYZING -> "Analyzing... ${item.progress}%"
                     ImgStatus.DOWNSCALING -> "Downscaling..."
                     ImgStatus.SAVING -> "Saving..."
-                    ImgStatus.DONE -> "${item.origW}x${item.origH} → ${item.outW}x${item.outH}  (tap: compare, log icon: details)"
+                    ImgStatus.DONE -> "${item.origW}x${item.origH} → ${item.outW}x${item.outH}"
                     ImgStatus.ERROR -> "Error: ${item.errorMsg}"
                 }
                 Text(statusText, fontSize = 12.sp, color = Color.Gray, maxLines = 2)
@@ -194,7 +195,7 @@ fun LogScreen(item: ImgItem, onBack: () -> Unit) {
         Spacer(modifier = Modifier.height(12.dp))
         LazyColumn(verticalArrangement = Arrangement.spacedBy(4.dp)) {
             items(item.logs) { line ->
-                Text(line, fontSize = 12.sp, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace)
+                Text(line, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
             }
         }
     }
@@ -352,16 +353,22 @@ fun saveToMediaStore(context: Context, name: String, bitmap: Bitmap): Uri? {
  * Downscale ladder: compute sharpness-per-pixel at each scale step.
  * As we shrink a blurry image, sharpness-per-pixel RISES while we're only removing
  * "empty" upscaled pixels, then FLATTENS once we start cutting into real detail.
- * We want the ratio just BEFORE it flattens — i.e. the smallest ratio that still
- * shows meaningful improvement over the previous step.
- * Bias: conservative (under-downscale) — requires two consecutive weak-gain steps
- * before committing to a plateau, and defaults to a higher (safer) ratio on ambiguity.
+ * We want the ratio just BEFORE it flattens.
+ *
+ * Noise handling: single-step deltas are unreliable (resize artifacts can cause a
+ * step to dip even mid-climb). Instead of comparing consecutive steps, we compare
+ * each step against the MAX score seen in the previous 2 steps (a rolling window),
+ * which smooths out one-off dips while still catching a genuine plateau.
+ *
+ * If growth never plateaus across the whole ladder (still climbing at the smallest
+ * step tested), the true resolution is at or below that smallest step — so we return
+ * the smallest tested ratio rather than falling back to "no downscale".
  */
 fun findTrueResolutionRatio(
     bitmap: Bitmap,
     onStep: (step: Int, ratio: Double, score: Double, progress: Int) -> Unit
 ): Double {
-    val steps = listOf(1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.25)
+    val steps = listOf(1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.25, 0.20, 0.15, 0.10)
     val scores = DoubleArray(steps.size)
 
     for ((i, ratio) in steps.withIndex()) {
@@ -372,18 +379,15 @@ fun findTrueResolutionRatio(
         onStep(i + 1, ratio, scores[i], ((i + 1) * 100) / steps.size)
     }
 
-    // Conservative plateau detection: require 2 consecutive steps with <3% gain
-    // before accepting a plateau, otherwise keep the higher-resolution ratio.
     var weakStreak = 0
-    for (i in 1 until steps.size) {
-        val prev = scores[i - 1]
+    for (i in 2 until steps.size) {
+        val windowMax = max(scores[i - 1], scores[i - 2])
         val curr = scores[i]
-        if (prev <= 0.0) continue
-        val gain = (curr - prev) / prev
-        if (gain < 0.03) {
+        if (windowMax <= 0.0) continue
+        val gain = (curr - windowMax) / windowMax
+        if (gain < 0.05) {
             weakStreak++
             if (weakStreak >= 2) {
-                // plateau confirmed — true resolution is the ratio BEFORE this weak streak started
                 return steps[i - weakStreak]
             }
         } else {
@@ -391,8 +395,7 @@ fun findTrueResolutionRatio(
         }
     }
 
-    // No clear plateau found — conservative default: keep original (don't downscale)
-    return 1.0
+    return steps.last()
 }
 
 fun laplacianVariancePerPixel(bitmap: Bitmap): Double {
